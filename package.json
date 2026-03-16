@@ -1,0 +1,53 @@
+{
+  "name": "openui",
+  "version": "1.2.1",
+  "description": "Visual canvas UI for managing AI coding agents locally",
+  "author": "JJ27",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JJ27/openui.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JJ27/openui/issues"
+  },
+  "homepage": "https://github.com/JJ27/openui#readme",
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "claude-code",
+    "opencode",
+    "terminal",
+    "canvas",
+    "ui"
+  ],
+  "type": "module",
+  "bin": {
+    "openui": "./bin/openui.ts"
+  },
+  "files": [
+    "bin/",
+    "server/",
+    "client/dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "bun run server/index.ts",
+    "dev": "concurrently \"bun run --watch server/index.ts\" \"bun run --cwd client dev\"",
+    "build": "bun run --cwd client build",
+    "prepublishOnly": "bun run build",
+    "install:client": "cd client && bun install"
+  },
+  "dependencies": {
+    "bun-pty": "^0.4.8",
+    "hono": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "bun": ">=1.0.0"
+  }
+}

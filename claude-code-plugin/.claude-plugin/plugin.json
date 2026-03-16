@@ -1,0 +1,8 @@
+{
+  "name": "openui-status",
+  "version": "1.0.0",
+  "description": "Reports Claude Code agent status to OpenUI for real-time status display",
+  "author": {
+    "name": "JJ27"
+  }
+}
