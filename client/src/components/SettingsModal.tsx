@@ -92,7 +92,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
               </div>
 
               {/* Content */}
-              <div className="p-5 space-y-6">
+              <div className="p-5 space-y-6 max-h-[60vh] overflow-y-auto">
                 {/* Update Channel */}
                 <div>
                   <h3 className="text-sm font-medium text-white mb-3">Updates</h3>

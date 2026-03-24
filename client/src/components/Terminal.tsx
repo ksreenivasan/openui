@@ -13,6 +13,8 @@ interface TerminalProps {
   nodeId: string;
   isShell?: boolean;
   visible?: boolean;
+  autoScrollPaused?: boolean;
+  jumpToBottomTrigger?: number;
 }
 
 // Cache key helpers
@@ -87,7 +89,7 @@ function clearLegacySnapshot(sessionId: string) {
   } catch {}
 }
 
-export function Terminal({ sessionId, color, nodeId, isShell, visible = true }: TerminalProps) {
+export function Terminal({ sessionId, color, nodeId, isShell, visible = true, autoScrollPaused = false, jumpToBottomTrigger = 0 }: TerminalProps) {
   const updateSession = useStore((state) => state.updateSession);
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<XTerm | null>(null);
@@ -100,9 +102,20 @@ export function Terminal({ sessionId, color, nodeId, isShell, visible = true }: 
   // Tracks the highest seq whose term.write() callback has fired, guaranteeing
   // that serialize() output is consistent with this seq on unmount.
   const committedSeqRef = useRef(0);
+  // Jump to bottom when triggered from parent (e.g., "jump to latest" button)
+  useEffect(() => {
+    if (jumpToBottomTrigger > 0 && xtermRef.current) {
+      userScrolledUpRef.current = false;
+      xtermRef.current.scrollToBottom();
+    }
+  }, [jumpToBottomTrigger]);
+
   // Track whether the user has manually scrolled up. This is more reliable
   // than checking wasAtBottom before each write, which races with rapid output.
   const userScrolledUpRef = useRef(false);
+  // Mirror the autoScrollPaused prop into a ref so write callbacks see latest value
+  const autoScrollPausedRef = useRef(autoScrollPaused);
+  autoScrollPausedRef.current = autoScrollPaused;
   // Save scroll state before terminal is hidden so we can restore it.
   // xterm reports viewportY=0 for hidden elements, so we capture while visible.
   const savedScrollRef = useRef<{ viewportY: number; wasAtBottom: boolean } | null>(null);
@@ -146,11 +159,17 @@ export function Terminal({ sessionId, color, nodeId, isShell, visible = true }: 
       const term = xtermRef.current;
       const fitAddon = fitAddonRef.current;
 
+      // Save position before fit() — it can reset viewport
+      const preY = term.buffer.active.viewportY;
       try {
         fitAddon.fit();
       } catch {}
 
-      if (scrollToBottomSettingRef.current) {
+      if (autoScrollPausedRef.current) {
+        // Per-session pause is active — restore position (fit may have reset it)
+        const saved = savedScrollRef.current;
+        term.scrollToLine(saved?.viewportY ?? preY);
+      } else if (scrollToBottomSettingRef.current) {
         // "Always scroll to latest output" — jump to bottom
         term.scrollToBottom();
       } else {
@@ -262,6 +281,27 @@ export function Terminal({ sessionId, color, nodeId, isShell, visible = true }: 
     fitAddonRef.current = fitAddon;
     serializeAddonRef.current = serializeAddon;
 
+    // Reactive scroll guard: when the user is scrolled up, eraseInDisplay (\x1b[2J)
+    // and lineFeed both reset the viewport to 0. Individual restores get overridden
+    // by the next write in the queue. Instead, we batch: schedule ONE restore via
+    // requestAnimationFrame that fires after all writes in the current frame.
+    let lastStableY = 0;
+    let scrollRestoreRAF: number | null = null;
+    term.onScroll((newY) => {
+      if (userScrolledUpRef.current || autoScrollPausedRef.current) {
+        if (newY !== lastStableY) {
+          if (scrollRestoreRAF) cancelAnimationFrame(scrollRestoreRAF);
+          scrollRestoreRAF = requestAnimationFrame(() => {
+            term.scrollToLine(lastStableY);
+            scrollRestoreRAF = null;
+          });
+          return; // Don't update lastStableY
+        }
+        return;
+      }
+      lastStableY = newY;
+    });
+
     // Track user scroll intent via wheel events (not xterm's onScroll, which
     // also fires for programmatic scrolls and races with rapid output).
     // Scrolling up = user wants to read history, so pause auto-scroll.
@@ -270,8 +310,11 @@ export function Terminal({ sessionId, color, nodeId, isShell, visible = true }: 
       if (!xtermRef.current) return;
       const t = xtermRef.current;
       if (e.deltaY < 0) {
-        // User scrolled up
+        // User scrolled up — update lastStableY after xterm processes the wheel
         userScrolledUpRef.current = true;
+        requestAnimationFrame(() => {
+          lastStableY = t.buffer.active.viewportY;
+        });
       } else if (e.deltaY > 0) {
         // User scrolled down — check if they've reached the bottom
         // Use requestAnimationFrame to check after xterm processes the scroll
@@ -421,9 +464,16 @@ export function Terminal({ sessionId, color, nodeId, isShell, visible = true }: 
               // Live output — append and schedule cache save
               if (msg.data) {
                 const seqAtWrite = lastSeqRef.current;
+                // Save viewport position BEFORE write — eraseInDisplay (\x1b[2J)
+                // inside the data will reset viewport to 0 during parsing
+                const preserveScroll = userScrolledUpRef.current || autoScrollPausedRef.current;
+                const savedY = preserveScroll ? term.buffer.active.viewportY : -1;
                 term.write(msg.data, () => {
                   committedSeqRef.current = seqAtWrite;
-                  if (!userScrolledUpRef.current && mountedRef.current) {
+                  if (savedY >= 0) {
+                    // Restore position after eraseInDisplay reset it
+                    term.scrollToLine(savedY);
+                  } else if (!userScrolledUpRef.current && !autoScrollPausedRef.current && mountedRef.current) {
                     term.scrollToBottom();
                   }
                 });
@@ -513,10 +563,15 @@ export function Terminal({ sessionId, color, nodeId, isShell, visible = true }: 
 
         const t = xtermRef.current;
 
+        // When user is scrolled up, defer fit() to avoid viewport resets.
+        // fit() reflows content and can cascade into more ResizeObserver events.
+        if (userScrolledUpRef.current || autoScrollPausedRef.current) {
+          return;
+        }
+
         fitAddonRef.current.fit();
 
-        // Keep at bottom unless user has manually scrolled up
-        if (!userScrolledUpRef.current) {
+        if (!userScrolledUpRef.current && !autoScrollPausedRef.current) {
           t.scrollToBottom();
         }
 
