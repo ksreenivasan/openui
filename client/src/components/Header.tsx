@@ -164,6 +164,7 @@ export function Header() {
             if (displaySessionId) params.set("sessionId", displaySessionId);
             params.set("cwd", displayCwd);
 
+            // TODO: Store EventSource in a ref and close on unmount to prevent leaked connections
             const es = new EventSource(`/api/cursor-workspace?${params}`);
             es.onmessage = (e) => {
               try {

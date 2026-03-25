@@ -598,6 +598,7 @@ export function Terminal({ sessionId, color, nodeId, isShell, visible = true, au
         } catch {}
       }
       mountedRef.current = false;
+      if (scrollRestoreRAF) cancelAnimationFrame(scrollRestoreRAF);
       if (cacheTimeout) clearTimeout(cacheTimeout);
       clearTimeout(connectTimeout);
       if (resizeTimeout) clearTimeout(resizeTimeout);

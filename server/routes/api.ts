@@ -717,6 +717,10 @@ function saveConfig(config: Record<string, any>) {
 
 const FILE_TOOLS = new Set(["Read", "Edit", "Write", "Grep", "Glob"]);
 
+function sanitizeSessionId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
 function trackWorkingDir(sessionId: string, filePath: string) {
   if (!filePath || !filePath.startsWith("/")) return;
   const dir = dirname(filePath);
@@ -724,7 +728,7 @@ function trackWorkingDir(sessionId: string, filePath: string) {
   if (dir.includes("/node_modules/") || dir.includes("/tmp/") || dir.startsWith("/tmp")) return;
   const workspacesDir = join(getDataDir(), "workspaces");
   if (!existsSync(workspacesDir)) mkdirSync(workspacesDir, { recursive: true });
-  const dirsFile = join(workspacesDir, `${sessionId}-dirs.txt`);
+  const dirsFile = join(workspacesDir, `${sanitizeSessionId(sessionId)}-dirs.txt`);
   try {
     appendFileSync(dirsFile, dir + "\n");
   } catch {}
@@ -733,7 +737,7 @@ function trackWorkingDir(sessionId: string, filePath: string) {
 function seedWorkingDirs(sessionId: string, worktreeRoot: string) {
   const workspacesDir = join(getDataDir(), "workspaces");
   if (!existsSync(workspacesDir)) mkdirSync(workspacesDir, { recursive: true });
-  const dirsFile = join(workspacesDir, `${sessionId}-dirs.txt`);
+  const dirsFile = join(workspacesDir, `${sanitizeSessionId(sessionId)}-dirs.txt`);
   if (existsSync(dirsFile)) return; // Already seeded
   // Read template
   const config = loadConfig();
@@ -1297,7 +1301,7 @@ apiRoutes.get("/cursor-workspace", async (c) => {
       }
 
       const workspacesDir = join(getDataDir(), "workspaces");
-      const dirsFile = sessionId ? join(workspacesDir, `${sessionId}-dirs.txt`) : null;
+      const dirsFile = sessionId ? join(workspacesDir, `${sanitizeSessionId(sessionId)}-dirs.txt`) : null;
       let rawDirs: string[] = [];
       if (dirsFile && existsSync(dirsFile)) {
         rawDirs = [...new Set(readFileSync(dirsFile, "utf8").split("\n").filter(Boolean))];
