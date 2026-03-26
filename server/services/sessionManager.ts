@@ -303,6 +303,7 @@ export async function createSession(params: {
     agentName,
     command,
     cwd: originalCwd,
+    launchCwd: originalCwd,
     gitBranch: gitBranch || undefined,
     createdAt: new Date().toISOString(),
     clients: new Set(),
@@ -474,6 +475,7 @@ export function restoreSessions() {
       agentName: node.agentName,
       command: node.command,
       cwd: node.cwd,
+      launchCwd: node.launchCwd || homedir(),
       gitBranch: gitBranch || node.gitBranch || undefined,
       createdAt: node.createdAt,
       clients: new Set(),
@@ -540,9 +542,9 @@ export function autoResumeSessions() {
     const startFn = () => {
       try {
         // Resolve the correct cwd for Claude session discovery
-        const resumeCwd = resolveResumeCwd(session.cwd, session.claudeSessionId);
+        const resumeCwd = resolveResumeCwd(session.launchCwd || session.cwd, session.claudeSessionId);
 
-        // Spawn a new PTY for this session
+        // Spawn a new PTY for this session (use launchCwd to avoid plugin-updated cwd issues)
         const ptyProcess = spawnPty("/bin/bash", [], {
           name: "xterm-256color",
           cwd: resumeCwd,
@@ -596,9 +598,16 @@ export function autoResumeSessions() {
           log(`\x1b[38;5;141m[auto-resume]\x1b[0m Resuming Claude session: ${session.claudeSessionId} (persisted to command)`);
         }
 
-        // Send the command to the PTY after a short delay
+        // Claude Code scopes --resume sessions to the directory they were created in.
+        // The PTY may spawn in a worktree dir, but claude sessions are created from ~.
+        // For resume: cd to ~ first. For fresh launches: use the PTY's cwd as-is.
+        const hasResume = finalCommand.includes("--resume");
         setTimeout(() => {
-          ptyProcess.write(`${finalCommand}\r`);
+          if (hasResume) {
+            ptyProcess.write(`cd ~ && ${finalCommand}\r`);
+          } else {
+            ptyProcess.write(`${finalCommand}\r`);
+          }
         }, 300);
 
         log(`\x1b[38;5;141m[auto-resume]\x1b[0m Resumed ${node.sessionId} (${node.agentName})`);

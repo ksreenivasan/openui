@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect, useCallback } from "react";
-import { Plus, Folder, Settings, Archive, Loader2, Search, HelpCircle } from "lucide-react";
+import { Plus, Folder, Settings, Archive, Loader2, Search, HelpCircle, GitBranch } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useStore } from "../stores/useStore";
 import { SettingsModal } from "./SettingsModal";
@@ -10,10 +10,48 @@ import { changelog, type ChangelogEntry } from "../data/changelog";
 const MAX_DISPLAY = 10;
 
 export function Header() {
-  const { setAddAgentModalOpen, sessions, launchCwd, showArchived, setShowArchived, autoResumeProgress } = useStore();
+  const { setAddAgentModalOpen, sessions, launchCwd, showArchived, setShowArchived, autoResumeProgress, selectedNodeId, activeCanvasId, nodes } = useStore();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [cursorLoading, setCursorLoading] = useState(false);
+  const [cursorStatus, setCursorStatus] = useState("");
+  const [cursorResult, setCursorResult] = useState<{ curatedDirs: string[]; rawDirCount: number } | null>(null);
+
+  // Detect remote SSH environment
+  const isRemote = useMemo(() => window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1", []);
+
+  // Shorten long paths for display
+  const shortenPath = useCallback((p: string) => {
+    const home = p.replace(/^\/home\/[^/]+/, "~");
+    if (home.length <= 50) return home;
+    const parts = home.split("/");
+    if (parts.length <= 3) return home;
+    const prefix = parts.slice(0, 2).join("/");
+    const suffix = parts.slice(-2).join("/");
+    return `${prefix}/.../${suffix}`;
+  }, []);
+
+  // Derive displayed cwd, gitBranch, and sessionId: selected session > first session on active canvas > launchCwd
+  const { displayCwd, displayBranch, displaySessionId } = useMemo(() => {
+    // 1. If a node is selected, use its session's cwd/branch
+    if (selectedNodeId) {
+      const session = sessions.get(selectedNodeId);
+      if (session?.cwd) return { displayCwd: session.cwd, displayBranch: session.gitBranch, displaySessionId: session.sessionId || selectedNodeId };
+    }
+    // 2. Use the cwd from the first session on the active canvas
+    if (activeCanvasId) {
+      const canvasNodeIds = nodes
+        .filter((n: any) => n.data?.canvasId === activeCanvasId)
+        .map((n) => n.id);
+      for (const nodeId of canvasNodeIds) {
+        const session = sessions.get(nodeId);
+        if (session?.cwd) return { displayCwd: session.cwd, displayBranch: session.gitBranch, displaySessionId: session.sessionId || nodeId };
+      }
+    }
+    // 3. Fallback to launchCwd
+    return { displayCwd: launchCwd, displayBranch: undefined, displaySessionId: undefined };
+  }, [selectedNodeId, activeCanvasId, nodes, sessions, launchCwd]);
 
   // "What's New" state
   const [seenIds, setSeenIds] = useState<Set<string>>(new Set());
@@ -101,9 +139,9 @@ export function Header() {
     : 0;
 
   return (
-    <header className="h-14 px-4 flex items-center justify-between border-b border-border bg-canvas-dark">
+    <header className="h-14 px-4 flex items-center justify-between border-b border-border bg-canvas-dark overflow-visible">
       {/* Logo */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 relative">
         <div className="flex items-center gap-2">
           <div className="w-6 h-6 rounded-md bg-gradient-to-br from-violet-500 to-orange-500 flex items-center justify-center">
             <div className="w-2 h-2 rounded-full bg-white" />
@@ -113,10 +151,116 @@ export function Header() {
 
         <div className="h-4 w-px bg-border mx-2" />
 
-        <div className="flex items-center gap-1.5 text-xs text-zinc-500">
-          <Folder className="w-3 h-3" />
-          <span className="font-mono truncate max-w-[200px]">{launchCwd?.replace(/^\/home\/[^/]+/, "~") || "~"}</span>
-        </div>
+        <button
+          disabled={cursorLoading}
+          onClick={async () => {
+            if (!displayCwd || cursorLoading) return;
+            setCursorLoading(true);
+            setCursorResult(null);
+            setCursorStatus("Resolving...");
+
+            const params = new URLSearchParams();
+            if (displayBranch) params.set("branch", displayBranch);
+            if (displaySessionId) params.set("sessionId", displaySessionId);
+            params.set("cwd", displayCwd);
+
+            // TODO: Store EventSource in a ref and close on unmount to prevent leaked connections
+            const es = new EventSource(`/api/cursor-workspace?${params}`);
+            es.onmessage = (e) => {
+              try {
+                const data = JSON.parse(e.data);
+                if (data.type === "status") {
+                  setCursorStatus(data.message);
+                } else if (data.type === "claude_stderr" || data.type === "claude_output") {
+                  setCursorStatus(data.text.slice(0, 80));
+                } else if (data.type === "result") {
+                  es.close();
+                  setCursorLoading(false);
+                  setCursorStatus("");
+
+                  // Open in Cursor
+                  const openPath = data.path || displayCwd;
+                  const sshHost = window.location.hostname;
+                  const uri = isRemote
+                    ? `cursor://vscode-remote/ssh-remote+${sshHost}${openPath}`
+                    : `cursor://file${openPath}`;
+                  const iframe = document.createElement("iframe");
+                  iframe.style.display = "none";
+                  iframe.src = uri;
+                  document.body.appendChild(iframe);
+                  setTimeout(() => iframe.remove(), 1000);
+
+                  // Show results toast
+                  if (data.curatedDirs?.length) {
+                    setCursorResult({ curatedDirs: data.curatedDirs, rawDirCount: data.rawDirCount || 0 });
+                    setTimeout(() => setCursorResult(null), 8000);
+                  }
+                }
+              } catch {}
+            };
+            es.onerror = () => {
+              es.close();
+              setCursorLoading(false);
+              setCursorStatus("");
+              // Fallback to direct cwd open
+              const sshHost = window.location.hostname;
+              const uri = isRemote
+                ? `cursor://vscode-remote/ssh-remote+${sshHost}${displayCwd}`
+                : `cursor://file${displayCwd}`;
+              const iframe = document.createElement("iframe");
+              iframe.style.display = "none";
+              iframe.src = uri;
+              document.body.appendChild(iframe);
+              setTimeout(() => iframe.remove(), 1000);
+            };
+          }}
+          className={`h-6 px-2 rounded-full flex items-center gap-1.5 bg-white/5 hover:bg-white/10 border border-white/5 hover:border-white/10 transition-colors text-[11px] ${cursorLoading ? "text-zinc-600 cursor-wait" : "text-zinc-400 hover:text-white"}`}
+          title={displayBranch ? `Open workspace for ${displayBranch}` : "Open in Cursor"}
+        >
+          {cursorLoading ? (
+            <Loader2 className="w-3 h-3 animate-spin" />
+          ) : (
+            <svg width="12" height="12" viewBox="675 357 250 286" fill="none">
+              <path d="M800 500L923.821 571.486C923.061 572.804 921.957 573.929 920.591 574.716L804.863 641.531C801.858 643.266 798.151 643.266 795.146 641.531L679.417 574.716C678.052 573.929 676.948 572.804 676.188 571.486L800 500Z" fill="currentColor" opacity="0.5"/>
+              <path d="M800 357.168V500L676.188 571.486C675.427 570.168 675.004 568.647 675.004 567.072V432.928C675.004 429.774 676.686 426.865 679.418 425.285L795.141 358.47C796.646 357.602 798.323 357.168 800 357.168Z" fill="currentColor" opacity="0.7"/>
+              <path d="M923.815 428.515C923.055 427.197 921.951 426.072 920.586 425.285L804.857 358.47C803.357 357.602 801.68 357.168 800 357.168V500L923.821 571.486C924.581 570.168 925.005 568.647 925.005 567.072V432.928C925.005 431.348 924.587 429.838 923.821 428.515Z" fill="currentColor"/>
+            </svg>
+          )}
+          {cursorLoading ? "..." : "Cursor"}
+        </button>
+        <div className="h-4 w-px bg-border mx-2" />
+        <span className="font-mono text-xs text-zinc-600 max-w-[400px] truncate whitespace-nowrap" title={displayCwd?.replace(/^\/home\/[^/]+/, "~") || "~"}>
+          cwd: {shortenPath(displayCwd || "")}
+        </span>
+        {/* Cursor workspace progress + result toast */}
+        {(cursorLoading || cursorResult) && (
+          <div className="absolute top-full left-0 mt-1 z-50 bg-zinc-800 border border-zinc-700 rounded-md px-3 py-2 shadow-lg max-w-md min-w-[280px]">
+            {cursorLoading && (
+              <div className="flex items-center gap-2">
+                <Loader2 className="w-3 h-3 animate-spin text-violet-400 flex-shrink-0" />
+                <span className="text-[11px] text-zinc-300 truncate">{cursorStatus || "Starting..."}</span>
+              </div>
+            )}
+            {cursorResult && (
+              <>
+                <div className="text-[10px] text-zinc-400 mb-1">
+                  Curated {cursorResult.rawDirCount} dirs &rarr; {cursorResult.curatedDirs.length} folders:
+                </div>
+                {cursorResult.curatedDirs.map((dir, i) => (
+                  <div key={i} className="text-[11px] text-green-400 font-mono truncate">
+                    {dir}
+                  </div>
+                ))}
+                <button
+                  onClick={() => setCursorResult(null)}
+                  className="absolute top-1 right-1.5 text-zinc-500 hover:text-white text-xs"
+                >
+                  x
+                </button>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Center - Status counts or auto-resume progress */}

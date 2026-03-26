@@ -377,6 +377,15 @@ await ensurePluginInstalled();
 await autoUpdateFromApi();
 await autoUpdateFromGit();
 
+// Fallback: install deps if node_modules is missing (e.g. wiped by git worktree ops)
+const nodeModulesPath = join(ROOT_DIR, "node_modules");
+if (!existsSync(nodeModulesPath)) {
+  console.log("\x1b[38;5;141m[deps]\x1b[0m node_modules missing, running bun install...");
+  await $`cd ${ROOT_DIR} && bun install`.quiet();
+  await $`cd ${join(ROOT_DIR, "client")} && bun install`.quiet();
+  console.log("\x1b[38;5;82m[deps]\x1b[0m Dependencies installed!\n");
+}
+
 // Fallback: build client if dist directory still doesn't exist
 // (e.g. first clone with --no-update, or non-git install)
 const clientDistPath = join(ROOT_DIR, "client", "dist");

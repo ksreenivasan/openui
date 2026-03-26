@@ -10,6 +10,7 @@ export interface Session {
   agentName: string;
   command: string;
   cwd: string;
+  launchCwd: string; // Original cwd at session creation — never updated by plugin hooks, used for auto-resume
   gitBranch?: string;
   createdAt: string;
   clients: Set<ServerWebSocket<WebSocketData>>;
@@ -72,6 +73,7 @@ export interface PersistedNode {
   agentName: string;
   command: string;
   cwd: string;
+  launchCwd?: string; // Original cwd — used for auto-resume PTY spawning
   createdAt: string;
   customName?: string;
   customColor?: string;

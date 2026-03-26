@@ -279,6 +279,7 @@ export function saveState(sessions: Map<string, Session>) {
       agentName: session.agentName,
       command: session.command,
       cwd: session.cwd,
+      launchCwd: session.launchCwd,
       createdAt: session.createdAt,
       customName: session.customName,
       customColor: session.customColor,

@@ -18,6 +18,9 @@ import {
   GitBranch,
   GitFork,
   Archive,
+  Pin,
+  PinOff,
+  ChevronsDown,
 } from "lucide-react";
 import { useStore, AgentStatus } from "../stores/useStore";
 import { Terminal } from "./Terminal";
@@ -80,6 +83,8 @@ export function Sidebar() {
   const [editIcon, setEditIcon] = useState("");
   const [terminalKey, setTerminalKey] = useState(0);
   const [forkDialogOpen, setForkDialogOpen] = useState(false);
+  const [autoScrollPaused, setAutoScrollPaused] = useState(false);
+  const [jumpToBottomTrigger, setJumpToBottomTrigger] = useState(0);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const saved = localStorage.getItem("openui-sidebar-width");
     return saved ? parseInt(saved, 10) : 512;
@@ -96,6 +101,7 @@ export function Sidebar() {
       setEditIcon(typeof nodeIcon === 'string' ? nodeIcon : "cpu");
     }
     setIsEditing(false);
+    setAutoScrollPaused(false);
     // Force terminal recreation when session changes
     setTerminalKey(k => k + 1);
   }, [session?.sessionId]); // Removed nodes and selectedNodeId to prevent closing on updates
@@ -478,10 +484,33 @@ export function Sidebar() {
                 <TerminalIcon className="w-3.5 h-3.5 text-zinc-500" />
                 <span className="text-xs text-zinc-500">Terminal</span>
               </div>
-              <div className="flex items-center gap-1">
-                <div className="w-2.5 h-2.5 rounded-full bg-[#FF5F56]" />
-                <div className="w-2.5 h-2.5 rounded-full bg-[#FFBD2E]" />
-                <div className="w-2.5 h-2.5 rounded-full bg-[#27CA40]" />
+              <div className="flex items-center gap-0.5 flex-shrink-0">
+                <button
+                  onClick={() => setAutoScrollPaused(p => !p)}
+                  className={`w-7 h-7 rounded flex items-center justify-center transition-colors ${
+                    autoScrollPaused
+                      ? "text-orange-400 bg-orange-500/10 hover:bg-orange-500/20"
+                      : "text-zinc-500 hover:text-white hover:bg-surface-active"
+                  }`}
+                  title={autoScrollPaused ? "Scroll pinned — click to resume auto-scroll" : "Pin scroll position"}
+                >
+                  {autoScrollPaused ? <Pin className="w-3.5 h-3.5" /> : <PinOff className="w-3.5 h-3.5" />}
+                </button>
+                <button
+                  onClick={() => {
+                    setAutoScrollPaused(false);
+                    setJumpToBottomTrigger(n => n + 1);
+                  }}
+                  className="w-7 h-7 rounded flex items-center justify-center text-zinc-500 hover:text-white hover:bg-surface-active transition-colors"
+                  title="Jump to latest output"
+                >
+                  <ChevronsDown className="w-3.5 h-3.5" />
+                </button>
+                <div className="flex items-center gap-1 ml-1">
+                  <div className="w-2.5 h-2.5 rounded-full bg-[#FF5F56]" />
+                  <div className="w-2.5 h-2.5 rounded-full bg-[#FFBD2E]" />
+                  <div className="w-2.5 h-2.5 rounded-full bg-[#27CA40]" />
+                </div>
               </div>
             </div>
 
@@ -491,6 +520,8 @@ export function Sidebar() {
                 sessionId={session.sessionId}
                 color={displayColor}
                 nodeId={selectedNodeId!}
+                autoScrollPaused={autoScrollPaused}
+                jumpToBottomTrigger={jumpToBottomTrigger}
               />
             </div>
 

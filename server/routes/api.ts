@@ -1,13 +1,14 @@
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import type { Agent } from "../types";
 import { sessions, createSession, deleteSession, injectPluginDir, broadcastToSession, MAX_BUFFER_SIZE, getGitBranch, DEFAULT_CLAUDE_COMMAND, resolveResumeCwd, handleKittyProtocol } from "../services/sessionManager";
 import { loadState, saveState, savePositions, getDataDir, loadCanvases, saveCanvases, migrateCategoriesToCanvases, atomicWriteJson, loadBuffer } from "../services/persistence";
 import { signalSessionReady, getQueueProgress } from "../services/sessionStartQueue";
 import { getTokensForSession } from "../services/costCache";
 import { spawnSync } from "bun";
-import { join } from "path";
+import { join, dirname } from "path";
 import { homedir } from "os";
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
 
 const LAUNCH_CWD = process.env.LAUNCH_CWD || process.cwd();
 const QUIET = !!process.env.OPENUI_QUIET;
@@ -332,6 +333,7 @@ apiRoutes.post("/sessions/:sessionId/restart", async (c) => {
       agentName: archivedNode.agentName,
       command: archivedNode.command,
       cwd: archivedNode.cwd,
+      launchCwd: archivedNode.launchCwd || homedir(),
       gitBranch: archivedNode.gitBranch || getGitBranch(archivedNode.cwd) || undefined,
       createdAt: archivedNode.createdAt,
       clients: new Set(),
@@ -363,7 +365,7 @@ apiRoutes.post("/sessions/:sessionId/restart", async (c) => {
     const { spawn } = await import("bun-pty");
     const ptyProcess = spawn("/bin/bash", [], {
       name: "xterm-256color",
-      cwd: session.cwd,
+      cwd: session.launchCwd || session.cwd,
       env: {
         ...process.env,
         TERM: "xterm-256color",
@@ -420,8 +422,17 @@ apiRoutes.post("/sessions/:sessionId/restart", async (c) => {
       log(`\x1b[38;5;141m[session]\x1b[0m Resuming Claude session: ${session.claudeSessionId} (persisted to command)`);
     }
 
+    // Claude Code scopes --resume sessions to the directory they were created in.
+    // The PTY spawns in session.launchCwd (which may be a worktree), but claude
+    // sessions are typically created from the home directory.
+    // For resume: cd to ~ first. For fresh launches: use the PTY's cwd as-is.
+    const hasResume = finalCommand.includes("--resume");
     setTimeout(() => {
-      ptyProcess.write(`${finalCommand}\r`);
+      if (hasResume) {
+        ptyProcess.write(`cd ~ && ${finalCommand}\r`);
+      } else {
+        ptyProcess.write(`${finalCommand}\r`);
+      }
     }, 300);
 
     log(`\x1b[38;5;141m[session]\x1b[0m Restarted ${sessionId}`);
@@ -685,6 +696,62 @@ apiRoutes.get("/sessions/:sessionId/context", (c) => {
   });
 });
 
+// ============ Config helpers (hoisted for use by working dir tracking) ============
+
+const configPath = join(getDataDir(), "config.json");
+
+function loadConfig(): Record<string, any> {
+  try {
+    if (existsSync(configPath)) {
+      return JSON.parse(readFileSync(configPath, "utf8"));
+    }
+  } catch {}
+  return {};
+}
+
+function saveConfig(config: Record<string, any>) {
+  atomicWriteJson(configPath, config);
+}
+
+// ============ Working Dir Tracking ============
+
+const FILE_TOOLS = new Set(["Read", "Edit", "Write", "Grep", "Glob"]);
+
+function sanitizeSessionId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function trackWorkingDir(sessionId: string, filePath: string) {
+  if (!filePath || !filePath.startsWith("/")) return;
+  const dir = dirname(filePath);
+  // Skip temp/build/node_modules dirs
+  if (dir.includes("/node_modules/") || dir.includes("/tmp/") || dir.startsWith("/tmp")) return;
+  const workspacesDir = join(getDataDir(), "workspaces");
+  if (!existsSync(workspacesDir)) mkdirSync(workspacesDir, { recursive: true });
+  const dirsFile = join(workspacesDir, `${sanitizeSessionId(sessionId)}-dirs.txt`);
+  try {
+    appendFileSync(dirsFile, dir + "\n");
+  } catch {}
+}
+
+function seedWorkingDirs(sessionId: string, worktreeRoot: string) {
+  const workspacesDir = join(getDataDir(), "workspaces");
+  if (!existsSync(workspacesDir)) mkdirSync(workspacesDir, { recursive: true });
+  const dirsFile = join(workspacesDir, `${sanitizeSessionId(sessionId)}-dirs.txt`);
+  if (existsSync(dirsFile)) return; // Already seeded
+  // Read template
+  const config = loadConfig();
+  const templatePath = config.cursorWorkspaceTemplate;
+  if (!templatePath || !existsSync(templatePath)) return;
+  try {
+    const template = JSON.parse(readFileSync(templatePath, "utf8"));
+    const lines = (template.folders || [])
+      .map((f: { path: string }) => join(worktreeRoot, f.path))
+      .join("\n") + "\n";
+    writeFileSync(dirsFile, lines);
+  } catch {}
+}
+
 // Status update endpoint for Claude Code plugin
 apiRoutes.post("/status-update", async (c) => {
   const body = await c.req.json();
@@ -768,6 +835,12 @@ apiRoutes.post("/status-update", async (c) => {
         effectiveStatus = "running";
         session.currentTool = toolName;
         session.preToolTime = Date.now();
+
+        // Track working directories from file tool inputs
+        if (FILE_TOOLS.has(toolName) && toolInput && openuiSessionId) {
+          const filePath = toolInput.file_path || toolInput.path;
+          if (filePath) trackWorkingDir(openuiSessionId, filePath);
+        }
 
         // Sleep detection: if Bash command starts with "sleep N", set waiting status + timer.
         // Only clear sleepEndTime for new Bash commands — parallel non-Bash tools (Read, Grep, etc.)
@@ -1179,22 +1252,160 @@ apiRoutes.get("/claude/projects", (c) => {
   }
 });
 
-// ============ Config (Settings) ============
+// ============ Cursor Workspace ============
 
-const configPath = join(getDataDir(), "config.json");
+// Resolve gitBranch -> worktree root (shared helper)
+function resolveWorktreeRoot(branch: string, fallbackCwd: string): string | null {
+  const candidates = [
+    fallbackCwd,
+    LAUNCH_CWD,
+  ].filter(Boolean);
 
-function loadConfig(): Record<string, any> {
-  try {
-    if (existsSync(configPath)) {
-      return JSON.parse(readFileSync(configPath, "utf8"));
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    const r = spawnSync(["git", "worktree", "list"], {
+      cwd: candidate,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (r.exitCode !== 0 || !r.stdout.toString().trim()) continue;
+
+    const lines = r.stdout.toString().trim().split("\n");
+    for (const line of lines) {
+      const match = line.match(/^(\S+)\s+\S+\s+\[(.+)\]$/);
+      if (match && match[2] === branch) {
+        return match[1];
+      }
     }
-  } catch {}
-  return {};
+  }
+  return null;
 }
 
-function saveConfig(config: Record<string, any>) {
-  atomicWriteJson(configPath, config);
-}
+// Generate a curated .code-workspace file using Claude to intelligently deduplicate dirs
+// Streams progress via SSE so the UI can show real-time Claude output
+apiRoutes.get("/cursor-workspace", async (c) => {
+  const branch = c.req.query("branch");
+  const sessionId = c.req.query("sessionId");
+  const fallbackCwd = c.req.query("cwd") || LAUNCH_CWD;
+  const home = homedir();
+  const shorten = (p: string) => p.startsWith(home) ? "~" + p.slice(home.length) : p;
+
+  return streamSSE(c, async (stream) => {
+    try {
+      await stream.writeSSE({ data: JSON.stringify({ type: "status", message: "Resolving worktree..." }) });
+
+      const worktreeRoot = branch ? resolveWorktreeRoot(branch, fallbackCwd) : null;
+
+      if (sessionId && worktreeRoot) {
+        seedWorkingDirs(sessionId, worktreeRoot);
+      }
+
+      const workspacesDir = join(getDataDir(), "workspaces");
+      const dirsFile = sessionId ? join(workspacesDir, `${sanitizeSessionId(sessionId)}-dirs.txt`) : null;
+      let rawDirs: string[] = [];
+      if (dirsFile && existsSync(dirsFile)) {
+        rawDirs = [...new Set(readFileSync(dirsFile, "utf8").split("\n").filter(Boolean))];
+      }
+
+      if (rawDirs.length === 0) {
+        await stream.writeSSE({ data: JSON.stringify({ type: "result", path: worktreeRoot || fallbackCwd, curatedDirs: [], rawDirCount: 0 }) });
+        return;
+      }
+
+      await stream.writeSSE({ data: JSON.stringify({ type: "status", message: `Curating ${rawDirs.length} directories with Claude...` }) });
+
+      const prompt = `You are given a list of directories that a coding agent has been working in. Produce a clean, minimal list of workspace folders for a VS Code workspace file.
+
+Rules:
+- Remove exact duplicates
+- If a parent directory and its child are both listed, keep ONLY the parent (e.g., if both /a/b and /a/b/c exist, keep only /a/b)
+- Drop directories under /tmp, node_modules, .git, dist, build, or __pycache__
+- Keep the list focused — aim for 3-8 folders max
+- If there are many scattered subdirs under a common parent, consolidate to the parent
+- Output ONLY absolute paths, one per line, no explanations, no markdown
+
+Directories:
+${rawDirs.join("\n")}`;
+
+      log(`[cursor-workspace] Curating ${rawDirs.length} dirs with Claude for session ${sessionId}`);
+
+      // Use async spawn so we can stream output
+      const proc = Bun.spawn(["claude", "-p", prompt], {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, ANTHROPIC_MODEL: "haiku" },
+      });
+
+      // Stream stderr (Claude's thinking/progress) to the client
+      const stderrReader = proc.stderr.getReader();
+      const decoder = new TextDecoder();
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await stderrReader.read();
+            if (done) break;
+            const text = decoder.decode(value, { stream: true });
+            if (text.trim()) {
+              await stream.writeSSE({ data: JSON.stringify({ type: "claude_stderr", text: text.trim() }) });
+            }
+          }
+        } catch {}
+      })();
+
+      // Collect stdout (the actual result)
+      let stdoutChunks: string[] = [];
+      const stdoutReader = proc.stdout.getReader();
+      while (true) {
+        const { done, value } = await stdoutReader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        stdoutChunks.push(text);
+        // Stream partial output to show Claude is working
+        if (text.trim()) {
+          await stream.writeSSE({ data: JSON.stringify({ type: "claude_output", text: text.trim() }) });
+        }
+      }
+
+      const exitCode = await proc.exited;
+      const claudeOutput = stdoutChunks.join("").trim();
+
+      let curatedDirs: string[];
+      if (exitCode === 0 && claudeOutput) {
+        curatedDirs = claudeOutput.split("\n")
+          .map(l => l.trim())
+          .filter(d => d.startsWith("/"));
+        log(`[cursor-workspace] Claude curated to ${curatedDirs.length} dirs`);
+      } else {
+        log(`[cursor-workspace] Claude failed (exit ${exitCode}), using raw dirs`);
+        curatedDirs = rawDirs;
+      }
+
+      // Write .code-workspace file
+      if (!existsSync(workspacesDir)) mkdirSync(workspacesDir, { recursive: true });
+      const safeName = sessionId || branch?.replace(/[^a-zA-Z0-9_-]/g, "_") || "default";
+      const workspacePath = join(workspacesDir, `${safeName}.code-workspace`);
+
+      const workspace = {
+        folders: curatedDirs.map(d => ({ path: d })),
+        settings: {},
+      };
+      writeFileSync(workspacePath, JSON.stringify(workspace, null, 2));
+
+      await stream.writeSSE({ data: JSON.stringify({
+        type: "result",
+        path: workspacePath,
+        worktreeRoot,
+        rawDirCount: rawDirs.length,
+        curatedDirs: curatedDirs.map(shorten),
+      }) });
+    } catch (e: any) {
+      log(`[cursor-workspace] Error: ${e.message}`);
+      await stream.writeSSE({ data: JSON.stringify({ type: "result", path: fallbackCwd }) });
+    }
+  });
+});
+
+// ============ Config (Settings) ============
 
 // GET /api/settings — read all user settings
 apiRoutes.get("/settings", (c) => {
