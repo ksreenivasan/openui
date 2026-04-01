@@ -359,7 +359,11 @@ apiRoutes.post("/sessions/:sessionId/restart", async (c) => {
     log(`\x1b[38;5;141m[restart]\x1b[0m Restored archived session ${sessionId} into sessions Map`);
   }
 
-  if (session.pty) return c.json({ error: "Session already running" }, 400);
+  // Kill existing PTY if present (e.g. after Ctrl+C leaves a zombie PTY)
+  if (session.pty) {
+    try { session.pty.kill(); } catch {}
+    session.pty = null as any;
+  }
 
   const startFn = async () => {
     const { spawn } = await import("bun-pty");

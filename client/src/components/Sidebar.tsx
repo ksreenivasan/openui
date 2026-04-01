@@ -486,6 +486,24 @@ export function Sidebar() {
               </div>
               <div className="flex items-center gap-0.5 flex-shrink-0">
                 <button
+                  onClick={async () => {
+                    if (!session?.sessionId) return;
+                    try {
+                      const res = await fetch(`/api/sessions/${session.sessionId}/restart`, { method: "POST" });
+                      if (res.ok) {
+                        setTerminalKey(k => k + 1);
+                        updateSession(selectedNodeId!, { status: "running", isRestored: false });
+                      }
+                    } catch (e) {
+                      console.error("Failed to restart session:", e);
+                    }
+                  }}
+                  className="w-7 h-7 rounded flex items-center justify-center text-zinc-500 hover:text-white hover:bg-surface-active transition-colors"
+                  title="Restart session"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                </button>
+                <button
                   onClick={() => setAutoScrollPaused(p => !p)}
                   className={`w-7 h-7 rounded flex items-center justify-center transition-colors ${
                     autoScrollPaused
